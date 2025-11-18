@@ -8,6 +8,10 @@ import requests
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from dotenv import load_dotenv
+
+# Load environment variables from .env at startup
+load_dotenv()
 
 APP_NAME = "Vintage Finds API"
 
