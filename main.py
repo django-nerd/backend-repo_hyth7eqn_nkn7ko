@@ -58,6 +58,7 @@ def extract_image_from_page(url: str) -> Optional[str]:
         # Simple regexes for meta tags
         patterns = [
             r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+property=["\']og:image:secure_url["\'][^>]+content=["\']([^"\']+)["\']',
             r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
         ]
         for pat in patterns:
@@ -211,72 +212,55 @@ def openai_generate_query(image_b64: str, vision_entities: Dict[str, Any], user_
     }
 
 
-# ---------- Marketplace post-processing rules ----------
+# ---------- Marketplace post-processing rules (Soft filtering) ----------
 
-NON_PRODUCT_SEGMENTS = [
+# Non-product segments (soft)
+SOFT_NON_PRODUCT = [
     "/blog",
     "/editorial",
-    "/articles",
+    "/article",
     "/stories",
     "/inspiration",
-    "/search",
-    "/shop",
     "/collections",
-    "/categories",
-    "/results",
+    "/press",
+    "/about",
 ]
 
-SOLD_KEYWORDS = [
-    "slutpris",
-    "såld",
-    "sold",
-    "/sold/",
-    "final price",
-    "closing price",
-    "avslutad",
-    "closed",
-    "ended",
-    "resultat",
-    "lot closed",
-    "auktionen är avslutad",
+# Product-like keyword hints (if at least 2, keep even if uncertain)
+PRODUCT_HINTS = [
+    "furniture", "table", "chair", "lamp", "sofa", "vintage", "mid-century", "product", "listing", "lot"
 ]
 
-ACTIVE_AUCTION_MARKERS = [
-    "dagen",
-    "pågående",
-    "auktionerar",
-    "current bid",
-    "bidding is open",
-    "auction ends in",
+SOLD_MARKERS_URL = ["/sold", "/slutpris", "/closed", "/result"]  # URL-level only
+SOLD_KEYWORDS_TEXT = [
+    "slutpris", "såld", "sold", "final price", "closing price", "avslutad", "closed", "ended", "resultat", "lot closed", "auktionen är avslutad"
 ]
 
 IMG_EXT_RE = re.compile(r"\.(jpg|jpeg|png|webp)(\?.*)?$", re.IGNORECASE)
 
 
-def is_non_product_url(url: str) -> bool:
+def canonicalize_url(url: str) -> str:
+    # Strip query and fragment to base URL
+    # e.g., https://example.com/p/123?utm=...#section -> https://example.com/p/123
+    base = url.split("#", 1)[0]
+    base = base.split("?", 1)[0]
+    return base
+
+
+def soft_is_non_product(url: str) -> bool:
     u = url.lower()
-    return any(seg in u for seg in NON_PRODUCT_SEGMENTS)
-
-
-def strip_tracking(url: str) -> str:
-    # Remove common tracking parameters
-    if "?" not in url:
-        return url
-    base, qs = url.split("?", 1)
-    clean_params = []
-    for pair in qs.split("&"):
-        key = pair.split("=", 1)[0].lower()
-        if key in ("utm_source", "utm_medium", "utm_campaign", "referrer", "analytics", "utm_term", "utm_content"):
-            continue
-        clean_params.append(pair)
-    if not clean_params:
-        return base
-    return base + "?" + "&".join(clean_params)
+    # If contains any explicit non-product segment -> likely non-product
+    if any(seg in u for seg in SOFT_NON_PRODUCT):
+        # However, if at least 2 product hints appear, consider product-like
+        hint_count = sum(1 for h in PRODUCT_HINTS if h in u)
+        if hint_count >= 2:
+            return False
+        return True
+    return False
 
 
 def pick_image_from_item(item: Dict[str, Any]) -> Optional[str]:
-    # Check common fields from Serper and CSE
-    # Order specified by requirements
+    # Try fields in the requested order
     candidates: List[Optional[str]] = []
     candidates.append(item.get("thumbnailUrl"))
     candidates.append(item.get("image") or item.get("imageUrl"))
@@ -291,6 +275,7 @@ def pick_image_from_item(item: Dict[str, Any]) -> Optional[str]:
     metatags = metatags_list[0] if isinstance(metatags_list, list) and metatags_list else {}
     if metatags:
         candidates.append(metatags.get("og:image"))
+        candidates.append(metatags.get("og:image:secure_url"))
         candidates.append(metatags.get("twitter:image"))
     cse_thumb = pagemap.get("cse_thumbnail")
     if isinstance(cse_thumb, list) and cse_thumb:
@@ -303,10 +288,8 @@ def pick_image_from_item(item: Dict[str, Any]) -> Optional[str]:
 
 
 def normalize_image_url(url: str) -> str:
-    # If no conventional image extension, append safe fallback
     if IMG_EXT_RE.search(url):
         return url
-    # keep existing query if present
     return url + ("&" if "?" in url else "?") + "format=jpg"
 
 
@@ -326,7 +309,6 @@ def normalize_price(text: Optional[str]) -> Optional[Dict[str, Any]]:
     if not text:
         return None
     t = text.strip()
-    # Try to find currency symbol or code and number
     m = re.search(r"(€|\$|£|sek|eur|usd|gbp|kr)\s*([0-9][0-9\s.,]*)", t, re.IGNORECASE)
     if not m:
         m = re.search(r"([0-9][0-9\s.,]*)\s*(€|\$|£|sek|eur|usd|gbp|kr)", t, re.IGNORECASE)
@@ -334,18 +316,14 @@ def normalize_price(text: Optional[str]) -> Optional[Dict[str, Any]]:
         return None
     g1, g2 = m.group(1), m.group(2) if m.lastindex and m.lastindex >= 2 else None
     if g2 is None:
-        # first pattern matched
         currency_raw, num_raw = g1, m.group(2)
     else:
-        # second pattern matched
         num_raw, currency_raw = g1, g2
     currency = CURRENCY_MAP.get(currency_raw.lower(), None)
-    # Sanitize numeric string
     num = re.sub(r"[\s,]", "", num_raw)
     try:
         value = float(num)
     except ValueError:
-        # try replacing comma as decimal separator
         try:
             value = float(num.replace(".", "").replace(",", "."))
         except ValueError:
@@ -363,7 +341,7 @@ class MarketplaceItem(BaseModel):
     title: str = ""
     url: str
     image: str
-    price: Dict[str, Optional[Any]] = Field(default_factory=lambda: {"value": None, "currency": None})
+    price: Optional[Dict[str, Optional[Any]]] = None
     location: str = ""
     isActive: bool = True
     relevanceScore: int = 0
@@ -440,16 +418,7 @@ def serper_search(query: str, site: str) -> List[SearchResult]:
         raise HTTPException(status_code=502, detail=f"Serper search error: {str(e)}")
 
 
-def _is_1stdibs_product(raw: Dict[str, Any], url: str) -> bool:
-    # Prefer explicit signals from page metadata
-    pagemap = raw.get("pagemap") or {}
-    metatags_list = pagemap.get("metatags")
-    metatags = metatags_list[0] if isinstance(metatags_list, list) and metatags_list else {}
-    og_type = (metatags.get("og:type") or metatags.get("og:type:content") or "").lower()
-    return ("/id-" in url) or (og_type == "product")
-
-
-def enforce_rules_and_normalize(items: List[SearchResult], source: str, query_terms: Dict[str, str], strict: bool = True) -> List[MarketplaceItem]:
+def enforce_rules_and_normalize(items: List[SearchResult], source: str, query_terms: Dict[str, str]) -> List[MarketplaceItem]:
     normalized: List[MarketplaceItem] = []
     seen_urls: Set[str] = set()
     for r in items:
@@ -462,74 +431,72 @@ def enforce_rules_and_normalize(items: List[SearchResult], source: str, query_te
         if not url:
             continue
 
-        # Global URL filters
-        if is_non_product_url(url):
-            continue
+        # Clean URL to canonical base
+        url = canonicalize_url(url)
 
-        # Source-specific filters
+        # Soft global non-product filter
+        if soft_is_non_product(url):
+            # If in doubt, keep — soft filter only rejects obvious non-product
+            pass
+
+        # Source-specific
         if src == "auctionet":
-            # reject sold/closed
-            if contains_any(url, SOLD_KEYWORDS) or contains_any(title, SOLD_KEYWORDS) or contains_any(snippet, SOLD_KEYWORDS):
+            # Only reject if URL clearly indicates sold/closed via URL markers
+            if any(marker in url.lower() for marker in SOLD_MARKERS_URL):
                 continue
-            if strict:
-                # require active markers only in strict mode
-                is_active_marker = contains_any(title, ACTIVE_AUCTION_MARKERS) or contains_any(snippet, ACTIVE_AUCTION_MARKERS)
-                if not is_active_marker:
-                    continue
+            # Do not require active markers; default to active
+            is_active = True
         elif src == "1stdibs":
-            # reject known non-product sections
-            if contains_any(url, ["/story/", "/editorial/", "/article/", "/our-edit/", "/collections", "/shop/", "/results"]):
+            u = url.lower()
+            if any(seg in u for seg in ["/editorial/", "stories.", "inspiration.", "/blog/", "search?"]):
                 continue
-            if strict:
-                # require /id- or explicit product meta in strict mode
-                if not _is_1stdibs_product(raw, url):
-                    continue
-            # always strip tracking
-            url = strip_tracking(url)
+            is_active = True
         elif src == "pamono":
-            # Pamono product pages contain /p/
             if "/p/" not in url:
                 continue
+            is_active = True
+        else:
+            is_active = True
 
-        # Image selection
+        # Image selection (must have something; placeholders acceptable)
         image_url = r.thumbnail or pick_image_from_item(raw)
         if not image_url:
+            # As last resort, try to extract from page if this is a product URL
+            extracted = extract_image_from_page(url)
+            if extracted:
+                image_url = extracted
+        if not image_url:
+            # No image at all -> discard
             continue
         image_url = normalize_image_url(image_url)
 
-        # Price normalization (from snippet/title if present)
-        price_struct = normalize_price(r.price or snippet or title) or {"value": None, "currency": None}
+        # Price optional
+        price_struct = normalize_price(r.price or snippet or title)
 
-        # Location heuristic (from snippet)
+        # Location heuristic
         location = ""
         mloc = re.search(r"(located in|ships from)\s+([^.|,]+)", snippet, re.IGNORECASE)
         if mloc:
             location = mloc.group(2).strip()
 
-        # Relevance scoring
+        # Relevance scoring (soft)
         score = 0
         q = query_terms
         low_title = (title or "").lower()
         if q.get("designer") and q["designer"].lower() in low_title:
-            score += 15
-        if q.get("model") and q["model"].lower() in low_title:
             score += 10
+        if q.get("model") and q["model"].lower() in low_title:
+            score += 6
         if q.get("manufacturer") and q["manufacturer"].lower() in low_title:
-            score += 8
+            score += 4
         if q.get("material") and q["material"].lower() in low_title:
-            score += 5
-        if q.get("style") and q["style"].lower() in low_title:
-            score += 3
-        if q.get("category") and q["category"].lower() in low_title:
             score += 2
+        if q.get("style") and q["style"].lower() in low_title:
+            score += 1
+        if q.get("category") and q["category"].lower() in low_title:
+            score += 1
 
-        # Auctionet bonus if ends > 6h (heuristic via snippet like "X hours")
-        if src == "auctionet":
-            mh = re.search(r"(\d+)\s+hours?", snippet, re.IGNORECASE)
-            if mh and int(mh.group(1)) > 6:
-                score += 5
-
-        # De-duplicate by URL
+        # De-duplicate by canonical URL
         if url in seen_urls:
             continue
         seen_urls.add(url)
@@ -540,9 +507,9 @@ def enforce_rules_and_normalize(items: List[SearchResult], source: str, query_te
                 title=title,
                 url=url,
                 image=image_url,
-                price=price_struct,
+                price=price_struct,  # may be None
                 location=location,
-                isActive=True,
+                isActive=is_active,
                 relevanceScore=score,
             )
         )
@@ -550,52 +517,22 @@ def enforce_rules_and_normalize(items: List[SearchResult], source: str, query_te
 
 
 def _take_top(items: List[MarketplaceItem], n: int = 4) -> List[MarketplaceItem]:
-    # Sort by relevance desc, then stable title tie-breaker
     items_sorted = sorted(items, key=lambda x: (-x.relevanceScore, x.title or ""))
     return items_sorted[:n]
 
 
 def search_marketplaces_structured(query: str, query_terms: Optional[Dict[str, str]] = None) -> Dict[str, List[MarketplaceItem]]:
-    # derive site-specific searches
     auctionet_raw = serper_search(query, "auctionet.com")
     firstdibs_raw = serper_search(query, "1stdibs.com")
     pamono_raw = search_pamono(query)
 
     q_terms = query_terms or {}
 
-    # Strict pass
-    auctionet_items = enforce_rules_and_normalize(auctionet_raw, "auctionet", q_terms, strict=True)
-    firstdibs_items = enforce_rules_and_normalize(firstdibs_raw, "1stdibs", q_terms, strict=True)
-    pamono_items = enforce_rules_and_normalize(pamono_raw, "pamono", q_terms, strict=True)
+    auctionet_items = enforce_rules_and_normalize(auctionet_raw, "auctionet", q_terms)
+    firstdibs_items = enforce_rules_and_normalize(firstdibs_raw, "1stdibs", q_terms)
+    pamono_items = enforce_rules_and_normalize(pamono_raw, "pamono", q_terms)
 
-    # Relaxed fallback if fewer than 4
-    if len(auctionet_items) < 4:
-        relaxed = enforce_rules_and_normalize(auctionet_raw, "auctionet", q_terms, strict=False)
-        # merge unique
-        urls = {i.url for i in auctionet_items}
-        for it in relaxed:
-            if it.url not in urls:
-                auctionet_items.append(it)
-                urls.add(it.url)
-
-    if len(firstdibs_items) < 4:
-        relaxed = enforce_rules_and_normalize(firstdibs_raw, "1stdibs", q_terms, strict=False)
-        urls = {i.url for i in firstdibs_items}
-        for it in relaxed:
-            if it.url not in urls:
-                firstdibs_items.append(it)
-                urls.add(it.url)
-
-    if len(pamono_items) < 4:
-        # for Pamono, relaxed == strict (rule stays /p/), but we still re-run in case of new images/prices
-        relaxed = enforce_rules_and_normalize(pamono_raw, "pamono", q_terms, strict=False)
-        urls = {i.url for i in pamono_items}
-        for it in relaxed:
-            if it.url not in urls:
-                pamono_items.append(it)
-                urls.add(it.url)
-
-    # Cap to 4 and sort by relevance
+    # Ensure up to 4 items per marketplace (soft filtering keeps more results)
     return {
         "Auctionet": _take_top(auctionet_items, 4),
         "1stDibs": _take_top(firstdibs_items, 4),
@@ -692,7 +629,6 @@ def search(body: SearchBody):
         "style": "",
         "category": "",
     }
-    # simple heuristics (e.g., words like 'lamp', 'table' as category)
     for cat in ["lamp", "table", "chair", "sofa", "pendant", "sideboard", "desk", "stool", "sconce", "chandelier"]:
         if cat in q.lower():
             terms["category"] = cat
@@ -711,17 +647,14 @@ async def analyze(
     if not query:
         raise HTTPException(status_code=500, detail="Failed to generate query")
 
-    # Build query terms from attribution to score relevance
     q_terms = {
         "designer": ident.gpt.get("designer") or "",
         "manufacturer": ident.gpt.get("manufacturer") or "",
         "model": ident.gpt.get("model") or "",
         "style": ident.gpt.get("style") or "",
-        # Materials not provided explicitly; try hints
         "material": (next((h for h in ident.entities.get("labels", []) if h and h.lower() in [
             "brass", "teak", "oak", "rosewood", "steel", "aluminum", "leather", "glass", "marble"
         ]), "")),
-        # Category from hints/best guesses
         "category": (next((h for h in (ident.entities.get("hints", []) or []) if h and h.lower() in [
             "lamp", "table", "chair", "sofa", "pendant", "sideboard", "desk", "stool", "sconce", "chandelier", "armchair", "coffee table", "dining table"
         ]), "")),
