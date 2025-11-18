@@ -4,7 +4,7 @@ import io
 import json
 import re
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import requests
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -440,17 +440,30 @@ def serper_search(query: str, site: str) -> List[SearchResult]:
         raise HTTPException(status_code=502, detail=f"Serper search error: {str(e)}")
 
 
-def enforce_rules_and_normalize(items: List[SearchResult], source: str, query_terms: Dict[str, str]) -> List[MarketplaceItem]:
+def _is_1stdibs_product(raw: Dict[str, Any], url: str) -> bool:
+    # Prefer explicit signals from page metadata
+    pagemap = raw.get("pagemap") or {}
+    metatags_list = pagemap.get("metatags")
+    metatags = metatags_list[0] if isinstance(metatags_list, list) and metatags_list else {}
+    og_type = (metatags.get("og:type") or metatags.get("og:type:content") or "").lower()
+    return ("/id-" in url) or (og_type == "product")
+
+
+def enforce_rules_and_normalize(items: List[SearchResult], source: str, query_terms: Dict[str, str], strict: bool = True) -> List[MarketplaceItem]:
     normalized: List[MarketplaceItem] = []
+    seen_urls: Set[str] = set()
     for r in items:
-        url = r.url or ""
+        url = (r.url or "").strip()
         title = r.title or ""
         snippet = r.snippet or ""
         raw = r.raw or {}
         src = source
 
+        if not url:
+            continue
+
         # Global URL filters
-        if not url or is_non_product_url(url):
+        if is_non_product_url(url):
             continue
 
         # Source-specific filters
@@ -458,16 +471,23 @@ def enforce_rules_and_normalize(items: List[SearchResult], source: str, query_te
             # reject sold/closed
             if contains_any(url, SOLD_KEYWORDS) or contains_any(title, SOLD_KEYWORDS) or contains_any(snippet, SOLD_KEYWORDS):
                 continue
-            # require active markers
-            is_active_marker = contains_any(title, ACTIVE_AUCTION_MARKERS) or contains_any(snippet, ACTIVE_AUCTION_MARKERS)
-            if not is_active_marker:
-                continue
+            if strict:
+                # require active markers only in strict mode
+                is_active_marker = contains_any(title, ACTIVE_AUCTION_MARKERS) or contains_any(snippet, ACTIVE_AUCTION_MARKERS)
+                if not is_active_marker:
+                    continue
         elif src == "1stdibs":
-            # reject editorial/collections/category pages and require /id-
-            if contains_any(url, ["/story/", "/editorial/", "/article/", "/our-edit/", "/collections?", "/furniture/", "/shop/", "/results"]) or "/id-" not in url:
+            # reject known non-product sections
+            if contains_any(url, ["/story/", "/editorial/", "/article/", "/our-edit/", "/collections", "/shop/", "/results"]):
                 continue
+            if strict:
+                # require /id- or explicit product meta in strict mode
+                if not _is_1stdibs_product(raw, url):
+                    continue
+            # always strip tracking
             url = strip_tracking(url)
         elif src == "pamono":
+            # Pamono product pages contain /p/
             if "/p/" not in url:
                 continue
 
@@ -509,6 +529,11 @@ def enforce_rules_and_normalize(items: List[SearchResult], source: str, query_te
             if mh and int(mh.group(1)) > 6:
                 score += 5
 
+        # De-duplicate by URL
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+
         normalized.append(
             MarketplaceItem(
                 source=src,
@@ -524,6 +549,12 @@ def enforce_rules_and_normalize(items: List[SearchResult], source: str, query_te
     return normalized
 
 
+def _take_top(items: List[MarketplaceItem], n: int = 4) -> List[MarketplaceItem]:
+    # Sort by relevance desc, then stable title tie-breaker
+    items_sorted = sorted(items, key=lambda x: (-x.relevanceScore, x.title or ""))
+    return items_sorted[:n]
+
+
 def search_marketplaces_structured(query: str, query_terms: Optional[Dict[str, str]] = None) -> Dict[str, List[MarketplaceItem]]:
     # derive site-specific searches
     auctionet_raw = serper_search(query, "auctionet.com")
@@ -531,10 +562,44 @@ def search_marketplaces_structured(query: str, query_terms: Optional[Dict[str, s
     pamono_raw = search_pamono(query)
 
     q_terms = query_terms or {}
+
+    # Strict pass
+    auctionet_items = enforce_rules_and_normalize(auctionet_raw, "auctionet", q_terms, strict=True)
+    firstdibs_items = enforce_rules_and_normalize(firstdibs_raw, "1stdibs", q_terms, strict=True)
+    pamono_items = enforce_rules_and_normalize(pamono_raw, "pamono", q_terms, strict=True)
+
+    # Relaxed fallback if fewer than 4
+    if len(auctionet_items) < 4:
+        relaxed = enforce_rules_and_normalize(auctionet_raw, "auctionet", q_terms, strict=False)
+        # merge unique
+        urls = {i.url for i in auctionet_items}
+        for it in relaxed:
+            if it.url not in urls:
+                auctionet_items.append(it)
+                urls.add(it.url)
+
+    if len(firstdibs_items) < 4:
+        relaxed = enforce_rules_and_normalize(firstdibs_raw, "1stdibs", q_terms, strict=False)
+        urls = {i.url for i in firstdibs_items}
+        for it in relaxed:
+            if it.url not in urls:
+                firstdibs_items.append(it)
+                urls.add(it.url)
+
+    if len(pamono_items) < 4:
+        # for Pamono, relaxed == strict (rule stays /p/), but we still re-run in case of new images/prices
+        relaxed = enforce_rules_and_normalize(pamono_raw, "pamono", q_terms, strict=False)
+        urls = {i.url for i in pamono_items}
+        for it in relaxed:
+            if it.url not in urls:
+                pamono_items.append(it)
+                urls.add(it.url)
+
+    # Cap to 4 and sort by relevance
     return {
-        "Auctionet": enforce_rules_and_normalize(auctionet_raw, "auctionet", q_terms),
-        "1stDibs": enforce_rules_and_normalize(firstdibs_raw, "1stdibs", q_terms),
-        "Pamono": enforce_rules_and_normalize(pamono_raw, "pamono", q_terms),
+        "Auctionet": _take_top(auctionet_items, 4),
+        "1stDibs": _take_top(firstdibs_items, 4),
+        "Pamono": _take_top(pamono_items, 4),
     }
 
 
