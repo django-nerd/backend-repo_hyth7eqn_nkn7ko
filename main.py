@@ -3,12 +3,13 @@ import base64
 import io
 import json
 import re
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 # Load environment variables from .env at startup
@@ -210,6 +211,164 @@ def openai_generate_query(image_b64: str, vision_entities: Dict[str, Any], user_
     }
 
 
+# ---------- Marketplace post-processing rules ----------
+
+NON_PRODUCT_SEGMENTS = [
+    "/blog",
+    "/editorial",
+    "/articles",
+    "/stories",
+    "/inspiration",
+    "/search",
+    "/shop",
+    "/collections",
+    "/categories",
+    "/results",
+]
+
+SOLD_KEYWORDS = [
+    "slutpris",
+    "såld",
+    "sold",
+    "/sold/",
+    "final price",
+    "closing price",
+    "avslutad",
+    "closed",
+    "ended",
+    "resultat",
+    "lot closed",
+    "auktionen är avslutad",
+]
+
+ACTIVE_AUCTION_MARKERS = [
+    "dagen",
+    "pågående",
+    "auktionerar",
+    "current bid",
+    "bidding is open",
+    "auction ends in",
+]
+
+IMG_EXT_RE = re.compile(r"\.(jpg|jpeg|png|webp)(\?.*)?$", re.IGNORECASE)
+
+
+def is_non_product_url(url: str) -> bool:
+    u = url.lower()
+    return any(seg in u for seg in NON_PRODUCT_SEGMENTS)
+
+
+def strip_tracking(url: str) -> str:
+    # Remove common tracking parameters
+    if "?" not in url:
+        return url
+    base, qs = url.split("?", 1)
+    clean_params = []
+    for pair in qs.split("&"):
+        key = pair.split("=", 1)[0].lower()
+        if key in ("utm_source", "utm_medium", "utm_campaign", "referrer", "analytics", "utm_term", "utm_content"):
+            continue
+        clean_params.append(pair)
+    if not clean_params:
+        return base
+    return base + "?" + "&".join(clean_params)
+
+
+def pick_image_from_item(item: Dict[str, Any]) -> Optional[str]:
+    # Check common fields from Serper and CSE
+    # Order specified by requirements
+    candidates: List[Optional[str]] = []
+    candidates.append(item.get("thumbnailUrl"))
+    candidates.append(item.get("image") or item.get("imageUrl"))
+    imgs = item.get("images")
+    if isinstance(imgs, list) and imgs:
+        candidates.append(imgs[0] if isinstance(imgs[0], str) else imgs[0].get("url"))
+    pagemap = item.get("pagemap") or {}
+    cse_image = pagemap.get("cse_image")
+    if isinstance(cse_image, list) and cse_image:
+        candidates.append(cse_image[0].get("src"))
+    metatags_list = pagemap.get("metatags")
+    metatags = metatags_list[0] if isinstance(metatags_list, list) and metatags_list else {}
+    if metatags:
+        candidates.append(metatags.get("og:image"))
+        candidates.append(metatags.get("twitter:image"))
+    cse_thumb = pagemap.get("cse_thumbnail")
+    if isinstance(cse_thumb, list) and cse_thumb:
+        candidates.append(cse_thumb[0].get("src"))
+
+    for c in candidates:
+        if c and isinstance(c, str):
+            return normalize_image_url(c)
+    return None
+
+
+def normalize_image_url(url: str) -> str:
+    # If no conventional image extension, append safe fallback
+    if IMG_EXT_RE.search(url):
+        return url
+    # keep existing query if present
+    return url + ("&" if "?" in url else "?") + "format=jpg"
+
+
+CURRENCY_MAP = {
+    "€": "EUR",
+    "eur": "EUR",
+    "sek": "SEK",
+    "kr": "SEK",
+    "usd": "USD",
+    "$": "USD",
+    "gbp": "GBP",
+    "£": "GBP",
+}
+
+
+def normalize_price(text: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    t = text.strip()
+    # Try to find currency symbol or code and number
+    m = re.search(r"(€|\$|£|sek|eur|usd|gbp|kr)\s*([0-9][0-9\s.,]*)", t, re.IGNORECASE)
+    if not m:
+        m = re.search(r"([0-9][0-9\s.,]*)\s*(€|\$|£|sek|eur|usd|gbp|kr)", t, re.IGNORECASE)
+    if not m:
+        return None
+    g1, g2 = m.group(1), m.group(2) if m.lastindex and m.lastindex >= 2 else None
+    if g2 is None:
+        # first pattern matched
+        currency_raw, num_raw = g1, m.group(2)
+    else:
+        # second pattern matched
+        num_raw, currency_raw = g1, g2
+    currency = CURRENCY_MAP.get(currency_raw.lower(), None)
+    # Sanitize numeric string
+    num = re.sub(r"[\s,]", "", num_raw)
+    try:
+        value = float(num)
+    except ValueError:
+        # try replacing comma as decimal separator
+        try:
+            value = float(num.replace(".", "").replace(",", "."))
+        except ValueError:
+            return None
+    return {"value": value, "currency": currency}
+
+
+def contains_any(text: str, keywords: List[str]) -> bool:
+    lt = text.lower()
+    return any(k in lt for k in keywords)
+
+
+class MarketplaceItem(BaseModel):
+    source: str
+    title: str = ""
+    url: str
+    image: str
+    price: Dict[str, Optional[Any]] = Field(default_factory=lambda: {"value": None, "currency": None})
+    location: str = ""
+    isActive: bool = True
+    relevanceScore: int = 0
+
+
 # ---------- Marketplace search helpers ----------
 
 class SearchResult(BaseModel):
@@ -219,6 +378,7 @@ class SearchResult(BaseModel):
     snippet: Optional[str] = None
     thumbnail: Optional[str] = None
     price: Optional[str] = None
+    raw: Optional[Dict[str, Any]] = None
 
 
 def search_pamono(query: str) -> List[SearchResult]:
@@ -239,12 +399,13 @@ def search_pamono(query: str) -> List[SearchResult]:
                 cse_thumb = pagemap["cse_thumbnail"][0].get("src")
             results.append(
                 SearchResult(
-                    source="Pamono",
+                    source="pamono",
                     title=it.get("title"),
                     url=it.get("link"),
                     snippet=it.get("snippet"),
                     thumbnail=cse_thumb,
                     price=None,
+                    raw=it,
                 )
             )
         return results
@@ -265,12 +426,13 @@ def serper_search(query: str, site: str) -> List[SearchResult]:
         for it in items:
             results.append(
                 SearchResult(
-                    source=site,
+                    source=site.split(".")[0].lower(),
                     title=it.get("title"),
                     url=it.get("link"),
                     snippet=it.get("snippet"),
                     thumbnail=(it.get("thumbnailUrl") or it.get("imageUrl")),
                     price=None,
+                    raw=it,
                 )
             )
         return results
@@ -278,11 +440,101 @@ def serper_search(query: str, site: str) -> List[SearchResult]:
         raise HTTPException(status_code=502, detail=f"Serper search error: {str(e)}")
 
 
-def search_marketplaces(query: str) -> Dict[str, List[SearchResult]]:
+def enforce_rules_and_normalize(items: List[SearchResult], source: str, query_terms: Dict[str, str]) -> List[MarketplaceItem]:
+    normalized: List[MarketplaceItem] = []
+    for r in items:
+        url = r.url or ""
+        title = r.title or ""
+        snippet = r.snippet or ""
+        raw = r.raw or {}
+        src = source
+
+        # Global URL filters
+        if not url or is_non_product_url(url):
+            continue
+
+        # Source-specific filters
+        if src == "auctionet":
+            # reject sold/closed
+            if contains_any(url, SOLD_KEYWORDS) or contains_any(title, SOLD_KEYWORDS) or contains_any(snippet, SOLD_KEYWORDS):
+                continue
+            # require active markers
+            is_active_marker = contains_any(title, ACTIVE_AUCTION_MARKERS) or contains_any(snippet, ACTIVE_AUCTION_MARKERS)
+            if not is_active_marker:
+                continue
+        elif src == "1stdibs":
+            # reject editorial/collections/category pages and require /id-
+            if contains_any(url, ["/story/", "/editorial/", "/article/", "/our-edit/", "/collections?", "/furniture/", "/shop/", "/results"]) or "/id-" not in url:
+                continue
+            url = strip_tracking(url)
+        elif src == "pamono":
+            if "/p/" not in url:
+                continue
+
+        # Image selection
+        image_url = r.thumbnail or pick_image_from_item(raw)
+        if not image_url:
+            continue
+        image_url = normalize_image_url(image_url)
+
+        # Price normalization (from snippet/title if present)
+        price_struct = normalize_price(r.price or snippet or title) or {"value": None, "currency": None}
+
+        # Location heuristic (from snippet)
+        location = ""
+        mloc = re.search(r"(located in|ships from)\s+([^.|,]+)", snippet, re.IGNORECASE)
+        if mloc:
+            location = mloc.group(2).strip()
+
+        # Relevance scoring
+        score = 0
+        q = query_terms
+        low_title = (title or "").lower()
+        if q.get("designer") and q["designer"].lower() in low_title:
+            score += 15
+        if q.get("model") and q["model"].lower() in low_title:
+            score += 10
+        if q.get("manufacturer") and q["manufacturer"].lower() in low_title:
+            score += 8
+        if q.get("material") and q["material"].lower() in low_title:
+            score += 5
+        if q.get("style") and q["style"].lower() in low_title:
+            score += 3
+        if q.get("category") and q["category"].lower() in low_title:
+            score += 2
+
+        # Auctionet bonus if ends > 6h (heuristic via snippet like "X hours")
+        if src == "auctionet":
+            mh = re.search(r"(\d+)\s+hours?", snippet, re.IGNORECASE)
+            if mh and int(mh.group(1)) > 6:
+                score += 5
+
+        normalized.append(
+            MarketplaceItem(
+                source=src,
+                title=title,
+                url=url,
+                image=image_url,
+                price=price_struct,
+                location=location,
+                isActive=True,
+                relevanceScore=score,
+            )
+        )
+    return normalized
+
+
+def search_marketplaces_structured(query: str, query_terms: Optional[Dict[str, str]] = None) -> Dict[str, List[MarketplaceItem]]:
+    # derive site-specific searches
+    auctionet_raw = serper_search(query, "auctionet.com")
+    firstdibs_raw = serper_search(query, "1stdibs.com")
+    pamono_raw = search_pamono(query)
+
+    q_terms = query_terms or {}
     return {
-        "Auctionet": serper_search(query, "auctionet.com"),
-        "1stDibs": serper_search(query, "1stdibs.com"),
-        "Pamono": search_pamono(query),
+        "Auctionet": enforce_rules_and_normalize(auctionet_raw, "auctionet", q_terms),
+        "1stDibs": enforce_rules_and_normalize(firstdibs_raw, "1stdibs", q_terms),
+        "Pamono": enforce_rules_and_normalize(pamono_raw, "pamono", q_terms),
     }
 
 
@@ -297,7 +549,7 @@ class IdentifyResponse(BaseModel):
 class AnalyzeResponse(BaseModel):
     query: str
     attribution: Dict[str, Any]
-    results: Dict[str, List[SearchResult]]
+    results: Dict[str, List[MarketplaceItem]]
     raw: IdentifyResponse
 
 
@@ -365,7 +617,22 @@ class SearchBody(BaseModel):
 
 @app.post("/search")
 def search(body: SearchBody):
-    return search_marketplaces(body.query)
+    # Use query terms heuristics from the query itself
+    q = body.query
+    terms = {
+        "designer": "",
+        "model": "",
+        "manufacturer": "",
+        "material": "",
+        "style": "",
+        "category": "",
+    }
+    # simple heuristics (e.g., words like 'lamp', 'table' as category)
+    for cat in ["lamp", "table", "chair", "sofa", "pendant", "sideboard", "desk", "stool", "sconce", "chandelier"]:
+        if cat in q.lower():
+            terms["category"] = cat
+            break
+    return search_marketplaces_structured(body.query, terms)
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
@@ -378,7 +645,25 @@ async def analyze(
     query = ident.gpt.get("query") or ""
     if not query:
         raise HTTPException(status_code=500, detail="Failed to generate query")
-    results = search_marketplaces(query)
+
+    # Build query terms from attribution to score relevance
+    q_terms = {
+        "designer": ident.gpt.get("designer") or "",
+        "manufacturer": ident.gpt.get("manufacturer") or "",
+        "model": ident.gpt.get("model") or "",
+        "style": ident.gpt.get("style") or "",
+        # Materials not provided explicitly; try hints
+        "material": (next((h for h in ident.entities.get("labels", []) if h and h.lower() in [
+            "brass", "teak", "oak", "rosewood", "steel", "aluminum", "leather", "glass", "marble"
+        ]), "")),
+        # Category from hints/best guesses
+        "category": (next((h for h in (ident.entities.get("hints", []) or []) if h and h.lower() in [
+            "lamp", "table", "chair", "sofa", "pendant", "sideboard", "desk", "stool", "sconce", "chandelier", "armchair", "coffee table", "dining table"
+        ]), "")),
+    }
+
+    results = search_marketplaces_structured(query, q_terms)
+
     attribution = {
         "designer": ident.gpt.get("designer"),
         "manufacturer": ident.gpt.get("manufacturer"),
