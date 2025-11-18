@@ -2,6 +2,7 @@ import os
 import base64
 import io
 import json
+import re
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -36,6 +37,35 @@ def require_env(name: str) -> str:
 
 def file_to_base64(file_bytes: bytes) -> str:
     return base64.b64encode(file_bytes).decode("utf-8")
+
+
+def fetch_bytes_from_url(url: str) -> bytes:
+    try:
+        r = requests.get(url, timeout=25)
+        r.raise_for_status()
+        return r.content
+    except requests.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch image from URL: {str(e)}")
+
+
+def extract_image_from_page(url: str) -> Optional[str]:
+    """Try to extract an image (og:image / twitter:image) from a generic webpage URL."""
+    try:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        html = r.text
+        # Simple regexes for meta tags
+        patterns = [
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+        ]
+        for pat in patterns:
+            m = re.search(pat, html, re.IGNORECASE)
+            if m:
+                return m.group(1)
+    except requests.RequestException:
+        return None
+    return None
 
 
 # ---------- Stage 1: Google Vision Web Detection ----------
@@ -108,7 +138,7 @@ def extract_entities_from_vision(vision: Dict[str, Any]) -> Dict[str, Any]:
 
 # ---------- Stage 2: OpenAI GPT-4o Vision ----------
 
-def openai_generate_query(image_b64: str, vision_entities: Dict[str, Any]) -> Dict[str, Any]:
+def openai_generate_query(image_b64: str, vision_entities: Dict[str, Any], user_description: Optional[str] = None) -> Dict[str, Any]:
     api_key = require_env("EXPO_PUBLIC_VIBECODE_OPENAI_API_KEY")
 
     system_prompt = (
@@ -129,19 +159,20 @@ def openai_generate_query(image_b64: str, vision_entities: Dict[str, Any]) -> Di
     # Build content with image as data URL
     data_url = f"data:image/jpeg;base64,{image_b64}"
 
+    content: List[Any] = [
+        {"type": "text", "text": user_instructions},
+        {"type": "text", "text": "Web hints:"},
+        {"type": "text", "text": json.dumps(vision_entities, ensure_ascii=False)},
+        {"type": "image_url", "image_url": {"url": data_url}},
+    ]
+    if user_description:
+        content.insert(0, {"type": "text", "text": f"User description: {user_description}"})
+
     payload = {
         "model": "gpt-4o",
         "messages": [
             {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_instructions},
-                    {"type": "text", "text": "Web hints:"},
-                    {"type": "text", "text": json.dumps(vision_entities, ensure_ascii=False)},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            },
+            {"role": "user", "content": content},
         ],
         "temperature": 0.2,
         "response_format": {"type": "json_object"},
@@ -293,13 +324,25 @@ def test():
 
 @app.post("/identify", response_model=IdentifyResponse)
 async def identify(
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
     original_filename: Optional[str] = Form(None),
+    image_url: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
 ):
     try:
-        content = await file.read()
+        content: Optional[bytes] = None
+        if file is not None:
+            content = await file.read()
+        elif image_url:
+            # If it's likely a webpage, try to extract og:image first
+            if not re.search(r"\.(jpg|jpeg|png|webp|gif)(\?.*)?$", image_url, re.IGNORECASE):
+                extracted = extract_image_from_page(image_url)
+                if extracted:
+                    image_url = extracted
+            content = fetch_bytes_from_url(image_url)
         if not content:
-            raise HTTPException(status_code=400, detail="Empty file")
+            raise HTTPException(status_code=400, detail="No image provided")
+
         image_b64 = file_to_base64(content)
 
         # Stage 1: Google Vision
@@ -307,7 +350,7 @@ async def identify(
         entities = extract_entities_from_vision(vision_raw)
 
         # Stage 2: OpenAI vision
-        gpt = openai_generate_query(image_b64, entities)
+        gpt = openai_generate_query(image_b64, entities, user_description=description)
 
         return IdentifyResponse(vision=vision_raw, entities=entities, gpt=gpt)
     except HTTPException:
@@ -326,8 +369,12 @@ def search(body: SearchBody):
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze(file: UploadFile = File(...)):
-    ident = await identify(file)
+async def analyze(
+    file: Optional[UploadFile] = File(None),
+    image_url: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+):
+    ident = await identify(file=file, image_url=image_url, description=description)
     query = ident.gpt.get("query") or ""
     if not query:
         raise HTTPException(status_code=500, detail="Failed to generate query")
